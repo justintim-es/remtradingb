@@ -2,18 +2,23 @@ const express = require('express');
 const router = express.Router();
 const stripe = require('stripe')('sk_test_51KVxlPAGQn2FqgzDtqLjvtGTOEEFqOVjNCMALmXVSodlaplQ6hHE1yczSONPOSGa8GVRpVUyGhnKQ3zYEfVvaeWM001Wtrx9YB');
 const Joi = require('joi');
-const { createSell, confirmSell, getConfirmSellConfirmation, onboardSell, createBuy, confirmBuy } = require('../schemas/sell');
+const { createSell, getUserById, confirmSell, onboardSell, createBuy, confirmBuy, getConfirmUserConfirmation, getUserOnboarding, updateUserConfirmation, updateBuyToSell } = require('../schemas/user');
 const bcrypt = require('bcrypt');
 const nodemailer = require('nodemailer');
 const randomString = require('random-string');
 const axios = require('axios');
+const { glaurl } = require('../constants');
+const auth = require('../middleware/auth');
 router.get('/new/:lang', async (req, res) => {
   const account = await stripe.accounts.create({
-    type: 'custom',
+    type: 'express',
     country: req.params.lang,
     capabilities: {
       card_payments: {requested: true},
       transfers: {requested: true},
+    },
+    business_profile: {
+      url: 'http://trade.gladiato.rs'
     }
   });
   return res.send(account.id);
@@ -50,7 +55,6 @@ router.post('/send-email', async (req, res) => {
     subject: "Confirm your e-mail", // Subject line
     text: "Pleas confirm your e-mail by pressing on the link below \nhttp://localhost:4200/confirm/" + confirmation, // plain text body
   });
-  console.log(info);
   return res.send();
 });
 const sendBuySchema = Joi.object({
@@ -61,18 +65,20 @@ const sendBuySchema = Joi.object({
 router.post('/send-email-buy', async (req, res) => {
   const schema = sendBuySchema.validate(req.body);
   const confirmation = randomString({ length: 64 });
+  const salt = await bcrypt.genSalt(10);
+  const hashed = await bcrypt.hash(req.body.password, salt);
   const sell = await createBuy(
     confirmation,
     req.body.email,
     hashed,
     req.body.accountId
   );
-  if (schema.error) return res.status(400).send()
+  if (schema.error) return res.status(400).send();
   let info = await transporter.sendMail({
     from: 'gladiatorscrypto@gmail.com', // sender address
     to: ["noahvandenbergh@hotmail.nl"], // list of receivers
     subject: "Confirm your e-mail", // Subject line
-    text: "Pleas confirm your e-mail by pressing on the link below \nhttp://localhost:4200/confirm/" + confirmation, // plain text body
+    text: "Pleas confirm your e-mail by pressing on the link below \nhttp://localhost:4200/confirm-buy/" + confirmation, // plain text body
   });
   return res.send();
 })
@@ -92,26 +98,50 @@ router.get('/link/:confirmation', async (req, res) => {
   const random = randomString({ length: 32 });
   const confirmation = req.params.confirmation;
   await confirmSell(confirmation, random);
-  const sell = await getConfirmSellConfirmation(confirmation);
+  const sell = await getConfirmUserConfirmation(confirmation);
   const accountLink = await stripe.accountLinks.create({
     account: sell.stripeAccountId,
-    refresh_url: 'https://buy.resalewebsite.io/onboarded/' + random,
-    return_url: 'https://buy.resalewebsite.io/login/' + random,
+    refresh_url: 'https://buy.resalewebsite.io/onboard-fail/' + confirmation,
+    return_url: 'https://buy.resalewebsite.io/onboarded/' + random,
     type: 'account_onboarding',
   });
+  await updateUserConfirmation(confirmation, accountLink.url);
   return res.send(accountLink.url);
 });
-router.post('/buy-confirm/:confirmation', async (req, res) => {
-  await confirmBuy(req.params.confirmation);
-  return res.send()
+router.get('/buy-to-sell-link/:stripe', auth, async (req, res) => {
+  const random = randomString({ length: 510 });
+  const stripeId = req.params.stripe;
+  const accountLink = await stripe.accountLinks.create({
+    account: req.params.stripe,
+    refresh_url: 'https://buy.resalewebsite.io/login/',
+    return_url: 'https://buy.resalewebsite.io/onboarded/' + random,
+    type: 'account_onboarding',
+  });
+  await updateBuyToSell(req.id, accountLink.url, random, stripeId);
+  return res.send(accountLink.url);
+})
+router.post('/confirm-buy/:confirmation', async (req, res) => {
+  const confirmation = req.params.confirmation;
+  const buy = await getConfirmUserConfirmation(confirmation);
+  if (!buy.public) {
+    axios.get(`${glaurl}/novus-propter`).then(async keypair => {
+      await confirmBuy(confirmation, keypair.data.publicaClavis, keypair.data.privatusClavis);
+      return res.send();    
+    }).catch(err => res.status(400).send('connection refused with blockchain'));
+  } else {
+    return res.status(400).send('user is already confirmed');
+  }
 })
 router.post('/onboarded/:onboarding', async (req, res) => {
   const onboarding = req.params.onboarding;
-  axios.get('http://127.0.0.1:1515/novus-propter').then(async keypair => {
-    console.log(keypair)
-    console.log('gotheres', keypair.publicaClavis, keypair.privatusClavis);
-    await onboardSell(onboarding, keypair.data.publicaClavis, keypair.data.privatusClavis);
-    return res.send();
-  }).catch(err => res.status(400).send(err))
+  const sell = await getUserOnboarding(onboarding);
+  if(!sell.public) {
+    await axios.get(`${glaurl}/novus-propter`).then(async keypair => {
+      await onboardSell(onboarding, keypair.data.publicaClavis, keypair.data.privatusClavis);
+      return res.send();
+    }).catch(err => res.status(400).send({ error: err }))
+  } else {
+    return res.status(400).send('user is already onboarded');     
+  }
 })
 module.exports = router;
